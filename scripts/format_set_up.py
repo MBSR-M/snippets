@@ -25,11 +25,8 @@ setup(
     author='Mubashir',
     author_email='mubashir.ai@outlook.com',
     include_package_data=True,
-    packages=find_packages('src'),
     package_dir={'': 'src'},
-    package_data={
-        '': ['config.conf'],
-    },
+    package_data={'': ['*.json', '*.yml', '*.conf']},
     license='Other/Proprietary License',
     install_requires=[
         'kafka-python',
