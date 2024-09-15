@@ -1,0 +1,74 @@
+#!/bin/bash
+
+set -e -o pipefail
+# set -x
+
+if [ -z "$1" ] || ! hash "$1" &>/dev/null; then
+    echo "Usage: $0 COMMAND [ARGS...]"
+    exit 1
+fi
+
+# set default image name
+MYSQL_IMAGE=${MYSQL_IMAGE:-bitnami/mysql:8.0.36}
+
+# confirm the image is available locally
+if ! docker inspect --format '{{.Parent}}' "$MYSQL_IMAGE" &>/dev/null; then
+    echo "MYSQL_IMAGE, $MYSQL_IMAGE, is not available locally"
+    exit 1
+fi
+
+generate_password() {
+    dd if=/dev/urandom bs=1024 count=1 status=none |tr -dc 'a-zA-Z0-9' |head --bytes=20
+}
+
+db_started_p() {
+    # this is customised for bitnami/mysql, which starts and stops
+    # mysql a few times before it is ready.  looking for open port
+    # 3306 may not be sufficient
+    docker logs "$cid" 2>&1 |fgrep -A20 'MySQL setup finished' |grep -q 'ready for connections.*port: 3306 '
+}
+
+# set default root password
+if [ -z "$MYSQL_ROOT_PASSWORD" ]; then
+    MYSQL_ROOT_PASSWORD=$(generate_password)
+fi
+
+# set default database
+MYSQL_DATABASE=${MYSQL_DATABASE:-test}
+
+# set default user
+MYSQL_USER=${MYSQL_DATABASE:-test}
+
+# set default (user) password
+if [ -z "$MYSQL_PASSWORD" ]; then
+   MYSQL_PASSWORD=$(generate_password)
+fi
+
+# set authentication plugin
+MYSQL_AUTHENTICATION_PLUGIN=${MYSQL_AUTHENTICATION_PLUGIN:-mysql_native_password}
+
+# start the mysql container and clean up when we exit
+cid=$(docker run -d --rm -e MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" -e MYSQL_DATABASE="$MYSQL_DATABASE" -e MYSQL_USER="$MYSQL_USER" -e MYSQL_PASSWORD="$MYSQL_PASSWORD" -e MYSQL_AUTHENTICATION_PLUGIN="$MYSQL_AUTHENTICATION_PLUGIN" "$MYSQL_IMAGE")
+trap "docker kill $cid &>/dev/null" EXIT
+
+# wait for mysql to start
+TIMEOUT=$[SECONDS + 60]
+while :; do
+    if db_started_p; then
+        break
+    fi
+    if [ $SECONDS -ge $TIMEOUT ]; then
+        echo 'Failed to start mysql'
+        docker logs $ci
+        exit 1
+    fi
+    sleep 1
+done
+
+# set host and port
+MYSQL_HOST=$(docker inspect --format='{{.NetworkSettings.IPAddress}}' $cid)
+MYSQL_PORT=3306
+
+# execute user command with all settings
+export MYSQL_IMAGE MYSQL_ROOT_PASSWORD MYSQL_DATABASE MYSQL_USER MYSQL_PASSWORD MYSQL_AUTHENTICATION_PLUGIN MYSQL_HOST MYSQL_PORT
+"$@"

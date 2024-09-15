@@ -1,0 +1,23 @@
+#!/bin/bash
+
+set -e
+
+td=$(mktemp -d)
+
+cleanup() {
+  rm -rf -- "$td"
+}
+
+trap "cleanup" EXIT
+
+conf="$td/mysql.conf"
+cat >>"$conf" <<EOT
+[client]
+host=$MYSQL_HOST
+port=$MYSQL_PORT
+user=$MYSQL_USER
+password=$MYSQL_PASSWORD
+database=$MYSQL_DATABASE
+EOT
+
+mysql --defaults-file="$conf" "$@"

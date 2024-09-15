@@ -1,0 +1,164 @@
+#!/bin/bash
+
+set -e -o pipefail
+# set -x
+
+if [ -z "$1" ] || ! hash "$1" &>/dev/null; then
+    echo "Usage: $0 COMMAND [ARGS...]"
+    exit 1
+fi
+
+# set default image name
+KAFKA_IMAGE=${KAFKA_IMAGE:-bitnami/kafka:3.7.0}
+
+# confirm the image is available locally
+if ! docker inspect --format '{{.Parent}}' "$KAFKA_IMAGE" &>/dev/null; then
+    echo "KAFKA_IMAGE, $KAFKA_IMAGE, is not available locally"
+    exit 1
+fi
+
+generate_password() {
+    dd if=/dev/urandom bs=1024 count=1 status=none |tr -dc 'a-zA-Z0-9' |head --bytes=20
+}
+
+get_docker0_ip() {
+    if ip --brief addr show docker0 &> /dev/null; then
+        for word in $(ip --brief addr show docker0); do
+            if [[ "$word" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/[0-9]+$ ]]; then
+                echo "${BASH_REMATCH[1]}"
+                return 0
+            fi
+        done
+    else
+        if [[ "$(ip --brief route get 2.3.4.5)" =~ via\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+            echo "${BASH_REMATCH[1]}"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# set host -- we will listen on the docker _host_
+KAFKA_HOST=$(get_docker0_ip)
+if [ -z "$KAFKA_HOST" ]; then
+    echo "Cannot determine docker0 interface IP address"
+    exit 1
+fi
+
+# set port -- we will listen on the docker _host
+KAFKA_PORT=9092
+
+# set bootstrap servers
+KAFKA_BOOTSTRAP_SERVERS="$KAFKA_HOST:$KAFKA_PORT"
+
+kafka_started_p() {
+    # this is customised for bitnami/kafka
+    docker logs "$cid" 2>&1 |fgrep -q '[KafkaRaftServer nodeId=0] Kafka Server started'
+}
+
+# set default user
+KAFKA_USER=${KAFKA_DATABASE:-test}
+
+# set default (user) password
+if [ -z "$KAFKA_PASSWORD" ]; then
+   KAFKA_PASSWORD=$(generate_password)
+fi
+
+# cleanup
+cleanup() {
+    set +e
+    if [ -n "$td" ]; then
+        rm -rf -- "$td"
+    fi
+    if [ -n "$cid" ]; then
+        docker kill "$cid" &>/dev/null
+    fi
+    if [ -n "$vid" ]; then
+        docker volume rm "$vid" &>/dev/null
+    fi
+}
+trap cleanup EXIT
+
+# generate CA keypair, server keypair, trust store, and key store
+td=$(mktemp -d)
+pushd "$td" &>/dev/null
+PKI_PASSWORD=$(generate_password)
+openssl genrsa -aes128 -passout pass:$PKI_PASSWORD -out ca.key 2048 &>/dev/null
+openssl req -new -x509 -passin pass:$PKI_PASSWORD -key ca.key -subj /CN=KafkaCA -out ca.crt &>/dev/null
+KAFKA_CA_CRT="$td/ca.crt"
+keytool -keystore kafka.truststore.jks -alias CA -import -noprompt -storepass $PKI_PASSWORD -file ca.crt &>/dev/null
+openssl genrsa -aes128 -passout pass:$PKI_PASSWORD -out server.key &>/dev/null
+openssl req -new -out server.csr -key server.key -passin pass:$PKI_PASSWORD -subj '/CN=Kafka' &>/dev/null -config <(cat <<EOF
+[req]
+prompt=no
+utf8=yes
+distinguished_name=dn_details
+req_extensions=san_details
+[dn_details]
+CN=Kafka
+[san_details]
+subjectAltName=IP:$KAFKA_HOST
+EOF
+)
+openssl x509 -req -CA ca.crt -CAkey ca.key -passin pass:$PKI_PASSWORD -in server.csr -out server.crt -days 365 -CAcreateserial -extensions v3_req -extfile &>/dev/null <(cat <<EOF
+[req]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+prompt=no
+[req_distinguished_name]
+CN=Kafka
+[v3_req]
+keyUsage=keyEncipherment,dataEncipherment,digitalSignature
+extendedKeyUsage=serverAuth
+subjectAltName=@alt_names
+[alt_names]
+IP.1=$KAFKA_HOST
+EOF
+)
+openssl pkcs12 -export -in server.crt -inkey server.key -passin pass:$PKI_PASSWORD -out server.p12 -passout pass:$PKI_PASSWORD -name $KAFKA_HOST -CAfile ca.crt -caname CA &>/dev/null
+keytool -importkeystore -destkeystore kafka.keystore.jks -deststorepass $PKI_PASSWORD -destkeypass $PKI_PASSWORD -srckeystore server.p12 -srcstoretype PKCS12 -srcstorepass $PKI_PASSWORD -alias $KAFKA_HOST &>/dev/null
+vid=$(docker volume create)
+cid=$(docker run -d --rm -v $vid:/$vid "$KAFKA_IMAGE" sleep 60)
+docker cp kafka.truststore.jks $cid:/$vid/ &>/dev/null
+docker cp kafka.keystore.jks $cid:/$vid/ &>/dev/null
+docker kill $cid &>/dev/null
+unset cid
+popd &>/dev/null
+
+# start the kafka container and clean up when we exit
+cid=$(docker run -d --rm \
+          -p $KAFKA_HOST:$KAFKA_PORT:$KAFKA_PORT \
+          -v $vid:/opt/bitnami/kafka/config/certs/ \
+          -e KAFKA_TLS_TRUSTSTORE_FILE=/opt/bitnami/kafka/config/certs/kafka.truststore.jks \
+          -e KAFKA_TLS_KEYSTORE_FILE=/opt/bitnami/kafka/config/certs/kafka.keystore.jks \
+          -e KAFKA_CERTIFICATE_PASSWORD=$PKI_PASSWORD \
+          -e KAFKA_CFG_NODE_ID=0 \
+          -e KAFKA_CFG_PROCESS_ROLES=controller,broker \
+          -e KAFKA_CFG_LISTENERS=SASL_SSL://:$KAFKA_PORT,CONTROLLER://:9093 \
+          -e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,SASL_SSL:SASL_SSL \
+          -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@127.0.0.1:9093 \
+          -e KAFKA_CFG_ADVERTISED_LISTENERS=SASL_SSL://$KAFKA_HOST:$KAFKA_PORT \
+          -e KAFKA_CFG_INTER_BROKER_LISTENER_NAME=SASL_SSL \
+          -e KAFKA_CFG_SASL_MECHANISM_INTER_BROKER_PROTOCOL=SCRAM-SHA-256 \
+          -e KAFKA_CLIENT_USERS="$KAFKA_USER" \
+          -e KAFKA_CLIENT_PASSWORDS="$KAFKA_PASSWORD" \
+          -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+          "$KAFKA_IMAGE")
+
+# wait for kafka to start
+TIMEOUT=$[SECONDS + 60]
+while :; do
+    if kafka_started_p; then
+        break
+    fi
+    if [ $SECONDS -ge $TIMEOUT ]; then
+        echo 'Failed to start kafka'
+        docker logs $ci
+        exit 1
+    fi
+    sleep 1
+done
+
+# execute user command with all settings
+export KAFKA_IMAGE KAFKA_HOST KAFKA_PORT KAFKA_BOOTSTRAP_SERVERS KAFKA_USER KAFKA_PASSWORD KAFKA_CA_CRT
+"$@"
