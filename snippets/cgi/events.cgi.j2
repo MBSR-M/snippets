@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import configparser
+import datetime
+import json
+import os
+import random
+import time
+
+import flask
+import requests
+import dateutil.tz
+import wsgiref.handlers
+
+
+app = flask.Flask(__name__)
+
+
+class SmaRequestError(RuntimeError):
+    def __init__(self, status_code, text):
+        super(SmaRequestError, self).__init__(
+            f'API call failed with status code: {status_code}',
+        )
+        self.status_code = status_code
+        self.text = text
+
+
+def retrieve_readings(
+        api_endpoint,
+        authorization,
+        formatted_profile_obis_code,
+        meters,
+):
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    if authorization:
+        headers['Authorization'] = authorization
+
+    response = requests.post(
+        api_endpoint,
+        json={
+            "formattedProfileObisCode": formatted_profile_obis_code,
+            "meters": meters,
+        },
+        headers=headers,
+    )
+
+    if response.status_code != 200:
+        raise SmaRequestError(response.status_code, response.text)
+
+    readings = response.json()
+    return readings
+
+
+def current_time_iso8601():
+    server_time = datetime.datetime.now(dateutil.tz.tzlocal()).strftime('%Y-%m-%dT%H:%M:%S%z')
+    server_time = f'{server_time[:-2]}:{server_time[-2:]}'
+    return server_time
+
+
+def chunk_and_send_readings(
+        readings,
+):
+    # pull out the events from the wrapper
+    chunks = readings['meterEvents']
+    readings['meterEvents'] = []
+
+    # format the wrapper
+    readings = json.dumps(readings)
+    readings = readings.split('"meterEvents": []')
+    assert len(readings) == 2
+
+    chunk_size = 10
+
+    yield readings[0]
+    yield '"meterEvents": ['
+    is_first_chunk = True
+
+    time.sleep(2.0*random.random() + 2.0)  # @todo timing
+
+    while chunks:
+        chunk, chunks = chunks[:chunk_size], chunks[chunk_size:]
+        for reading in chunk:
+            time.sleep(0.009*random.random() + 0.09)  # @todo timing
+            reading['serverTime'] = current_time_iso8601()
+
+        if not is_first_chunk:
+            yield ','
+        is_first_chunk = False
+
+        chunk = json.dumps(chunk)
+        chunk = chunk[1:-1]
+        yield chunk
+
+    yield ']'
+    yield readings[1]
+
+
+def make_error(message, status):
+    return (
+        json.dumps(
+            {
+                "message": message,
+                "status": status,
+            },
+        ),
+        status
+    )
+
+
+@app.route('/', methods=['POST'])
+def process_readings():
+    try:
+        config = configparser.ConfigParser()
+        config.read('{{ apache_rootdir}}/etc/all-events-api-adaptor.ini')
+        api_endpoint = config.get('settings', 'api_endpoint')
+        authorization = os.environ.get('HTTP_AUTHORIZATION')
+
+        return process_readings_wrapped(
+            api_endpoint,
+            authorization,
+            flask.request.get_json(),
+        )
+    except SmaRequestError as e:
+        return (
+            e.text,
+            e.status_code,
+        )
+    except requests.exceptions.RequestException:
+        return make_error("Error communicating with API endpoint", 500)
+    except Exception:
+        # @todo log the exception for investigation
+        return make_error("An error occurred", 500)
+
+
+def process_readings_wrapped(
+        api_endpoint,
+        authorization,
+        request_data,
+):
+    formatted_profile_obis_code = request_data.get('formattedProfileObisCode')
+    if not formatted_profile_obis_code:
+        # @todo verify this error matches the underlying API
+        return make_error("Missing required field, formattedProfileObisCode", 400)
+
+    meters = request_data.get('meters', [])
+
+    readings = retrieve_readings(
+        api_endpoint,
+        authorization,
+        formatted_profile_obis_code,
+        meters,
+    )
+
+    return flask.Response(
+        flask.stream_with_context(
+            chunk_and_send_readings(readings),
+        ),
+        status=200,
+        mimetype="application/json",
+    )
+
+
+if __name__ == '__main__':
+    wsgiref.handlers.CGIHandler().run(app)

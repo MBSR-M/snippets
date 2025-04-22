@@ -57,7 +57,7 @@ class MySQLConnector:
         finally:
             cursor.close()
 
-    @set_session_params
+    # @set_session_params
     @measure_and_log_elapsed_time
     def execute_query(self, query):
         """Executes a query and returns the result."""
@@ -76,3 +76,6 @@ class MySQLConnector:
             logger.info("MySQL connection closed")
         else:
             logger.info("No active MySQL connection to close")
+
+    def is_connected(self):
+        return self.connection.is_connected() if self.connection else False

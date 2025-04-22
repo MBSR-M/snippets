@@ -1,0 +1,51 @@
+{
+  "user": {
+    "id": 12345,
+    "name": "John Doe",
+    "email": "john.doe@example.com",
+    "active": true,
+    "roles": ["admin", "editor"],
+    "profile": {
+      "age": 30,
+      "location": "New York, USA",
+      "preferences": {
+        "theme": "dark",
+        "notifications": "enabled"
+      }
+    },
+    "subscriptions": [
+      {
+        "id": "sub001",
+        "type": "premium",
+        "start_date": "2024-01-01",
+        "expiry_date": "2025-01-01"
+      },
+      {
+        "id": "sub002",
+        "type": "basic",
+        "start_date": "2023-05-15",
+        "expiry_date": "2024-05-15"
+      }
+    ]
+  },
+  "settings": {
+    "language": "en",
+    "timezone": "GMT",
+    "privacy": {
+      "profile_visibility": "public",
+      "search_engine_indexing": false
+    }
+  },
+  "logs": [
+    {
+      "timestamp": "2025-01-28T14:23:00Z",
+      "level": "INFO",
+      "message": "User logged in successfully."
+    },
+    {
+      "timestamp": "2025-01-28T15:45:00Z",
+      "level": "ERROR",
+      "message": "Failed to update profile image."
+    }
+  ]
+}
